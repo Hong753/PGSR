@@ -31,6 +31,6 @@ for scene in scenes:
           f"--input_mesh {out_base_path}/dtu_scan{scene}/{out_name}/mesh/tsdf_fusion_post.ply " + \
           f"--scan_id {scene} --output_dir {out_base_path}/dtu_scan{scene}/{out_name}/mesh " + \
           f"--mask_dir {data_base_path} " + \
-          f"--DTU {eval_path} --use_icp"
+          f"--DTU {eval_path}" #+ " --use_icp"
     print(cmd)
     os.system(cmd)
