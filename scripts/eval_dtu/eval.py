@@ -155,7 +155,7 @@ if __name__ == '__main__':
     pbar.set_description('done')
     pbar.close()
     over_all = (mean_d2s + mean_s2d) / 2
-    print(mean_d2s, mean_s2d, over_all)
+    print(f"scan{args.scan}:".format(), mean_d2s, mean_s2d, over_all)
     
     import json
     with open(f'{args.vis_out_dir}/results.json', 'w') as fp:

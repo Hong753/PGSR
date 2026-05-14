@@ -1,5 +1,4 @@
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import cv2
 import numpy as np
@@ -10,9 +9,7 @@ import argparse
 
 import trimesh
 from pathlib import Path
-import subprocess
 
-import sys
 import render_utils as rend_util
 from tqdm import tqdm
 
@@ -112,6 +109,9 @@ if __name__ == "__main__":
     parser.add_argument('--output_dir', type=str, default='evaluation_results_single', help='path to the output folder')
     parser.add_argument('--mask_dir', type=str,  default='mask', help='path to uncropped mask')
     parser.add_argument('--DTU', type=str,  default='Offical_DTU_Dataset', help='path to the GT DTU point clouds')
+    parser.add_argument('--use_icp', action='store_true', help='apply ICP refinement to GT before chamfer eval')
+    parser.add_argument('--icp_threshold', type=float, default=1.0, help='ICP max correspondence distance in mm (lower = more conservative)')
+    parser.add_argument('--icp_max_iter', type=int, default=100)
     args = parser.parse_args()
 
     Offical_DTU_Dataset = args.DTU
@@ -123,6 +123,51 @@ if __name__ == "__main__":
     print("cull mesh ....")
     result_mesh_file = os.path.join(out_dir, "culled_mesh.ply")
     cull_scan(scan, ply_file, result_mesh_file, instance_dir=os.path.join(args.mask_dir, f'scan{args.scan_id}'))
+    
+    # ---- ICP refinement (optional) ----------------------------------------
+    if args.use_icp:
+        import open3d as o3d
+        print("ICP refinement ....")
+
+        # Reload the culled+world-transformed mesh
+        culled = o3d.io.read_triangle_mesh(result_mesh_file)
+        src = o3d.geometry.PointCloud()
+        src.points = o3d.utility.Vector3dVector(np.asarray(culled.vertices))
+
+        # Load DTU GT point cloud
+        scan_int = int(args.scan_id)
+        gt_path = f'{Offical_DTU_Dataset}/Points/stl/stl{scan_int:03d}_total.ply'
+        tgt = o3d.io.read_point_cloud(gt_path)
+
+        # Try new API first, fall back to old (PGSR/TnT uses old)
+        try:
+            reg = o3d.pipelines.registration.registration_icp(
+                src, tgt,
+                args.icp_threshold,
+                np.identity(4),
+                o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
+                o3d.pipelines.registration.ICPConvergenceCriteria(
+                    relative_fitness=1e-6,
+                    relative_rmse=1e-6,
+                    max_iteration=args.icp_max_iter,
+                ),
+            )
+        except AttributeError:
+            reg = o3d.registration.registration_icp(
+                src, tgt,
+                args.icp_threshold,
+                np.identity(4),
+                o3d.registration.TransformationEstimationPointToPoint(False),
+                o3d.registration.ICPConvergenceCriteria(1e-6, args.icp_max_iter),
+            )
+
+        # print(f"  ICP fitness={reg.fitness:.4f}, inlier_rmse={reg.inlier_rmse:.4f}")
+        # print(f"  transform=\n{reg.transformation}")
+
+        # Apply transform and re-save
+        culled.transform(reg.transformation)
+        o3d.io.write_triangle_mesh(result_mesh_file, culled)
+    # -----------------------------------------------------------------------
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     cmd = f"python {script_dir}/eval.py --data {result_mesh_file} --scan {scan} --mode mesh --dataset_dir {Offical_DTU_Dataset} --vis_out_dir {out_dir}"
