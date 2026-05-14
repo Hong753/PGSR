@@ -1,7 +1,7 @@
 import os
 
 # scenes = [24, 37, 40, 55, 63, 65, 69, 83, 97, 105, 106, 110, 114, 118, 122]
-scenes = [24]
+scenes = [37, 40]
 data_base_path='/workspace/colmap_scenes/DTU/dtu'
 out_base_path='/workspace/colmap_scenes/DTU/dtu_output'
 eval_path='/workspace/colmap_scenes/DTU/dtu_eval'
