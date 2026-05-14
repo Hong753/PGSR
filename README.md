@@ -14,6 +14,7 @@ The Chamfer Distance↓ on the DTU dataset
 |PGSR(Paper)|0.34|0.58|0.29|0.29|0.78|0.58|0.54|1.01|0.73|0.51|0.49|0.69|0.31|0.37|0.38|0.53|0.6h|
 |PGSR(Code_V1.0)|0.33|0.51|0.29|0.28|0.75|0.53|0.46|0.92|0.62|0.48|0.45|0.55|0.29|0.33|0.31|0.47|0.5h|
 |PGSR(Remove ICP)|0.36|0.57|0.38|0.33|0.78|0.58|0.50|1.08|0.63|0.59|0.46|0.54|0.30|0.38|0.34|0.52|0.5h|
+|PGSR(Reproduce)|0.33|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|0.5h|
 
 The F1 Score↑ on the TnT dataset
 ||PGSR(Paper)|PGSR(Code_V1.0)
@@ -32,16 +33,19 @@ The F1 Score↑ on the TnT dataset
 The repository contains submodules, thus please check it out with 
 ```shell
 # SSH
-git clone git@github.com:zju3dv/PGSR.git
+git clone git@github.com:Hong753/PGSR.git
 cd PGSR
 
-conda create -n pgsr python=3.8
+conda create -n pgsr python=3.12 -y
 conda activate pgsr
 
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118 #replace your cuda version
+# Optional
+conda install spyder -y
+
+pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu128
 pip install -r requirements.txt
-pip install submodules/diff-plane-rasterization
-pip install submodules/simple-knn
+pip install --no-build-isolation git+https://github.com/camenduru/simple-knn
+pip install --no-build-isolation submodules/diff-plane-rasterization
 ```
 
 ## Dataset Preprocess
@@ -51,7 +55,7 @@ The data folder should like this:
 ```shell
 data
 ├── dtu_dataset
-│   ├── dtu
+│   ├── dtu
 │   │   ├── scan24
 │   │   │   ├── images
 │   │   │   ├── mask
@@ -59,12 +63,12 @@ data
 │   │   │   ├── cameras_sphere.npz
 │   │   │   └── cameras.npz
 │   │   └── ...
-│   ├── dtu_eval
+│   ├── dtu_eval
 │   │   ├── Points
 │   │   │   └── stl
 │   │   └── ObsMask
 ├── tnt_dataset
-│   ├── tnt
+│   ├── tnt
 │   │   ├── Ignatius
 │   │   │   ├── images_raw
 │   │   │   ├── Ignatius_COLMAP_SfM.log
@@ -106,7 +110,7 @@ The data folder should like this:
 ```shell
 data
 ├── data_name1
-│   └── input
+│   └── input
 │       ├── *.jpg/*.png
 │       └── ...
 ├── data_name2
