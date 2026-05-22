@@ -112,6 +112,8 @@ class GroupModel:
 
     @property
     def rho(self) -> torch.Tensor:
+        """In-plane scales per group, shape (K, 2): (rho_u, rho_v)
+        in the deterministic tangent basis built from m_k."""
         return torch.exp(self._log_rho)
 
     @property
@@ -181,22 +183,30 @@ class GroupModel:
                 if mask.sum() > 0:
                     centers[k] = pts[mask].mean(dim=0)
 
-        # Per-cluster normals via PCA + rho from in-plane spread
+        # Per-cluster normals via PCA + anisotropic rho from per-axis spread
         normals = torch.zeros(K, 3, device=device)
-        rhos = torch.zeros(K, device=device)
+        rhos_uv = torch.zeros(K, 2, device=device)
         for k in range(K):
             mask = assn == k
             cnt = int(mask.sum().item())
             if cnt < 3:
                 normals[k] = torch.tensor([0.0, 0.0, 1.0], device=device)
-                rhos[k] = 0.1
+                rhos_uv[k] = torch.tensor([0.1, 0.1], device=device)
                 continue
             diff = pts[mask] - centers[k]
             S = diff.T @ diff / cnt
             vals, vecs = torch.linalg.eigh(S)
             normals[k] = vecs[:, 0]                      # smallest eigenvalue dir
-            in_plane_var = vals[1] + vals[2]
-            rhos[k] = rho_init_scale * torch.sqrt(in_plane_var.clamp_min(1e-6))
+            # Compute tangent basis from this normal (matches what
+            # gather_at will use at query time -- deterministic Gram-Schmidt
+            # from a fixed reference) so the rho values are in the right basis.
+            u_k, v_k = _tangent_basis(normals[k:k+1])
+            u_k = u_k[0]; v_k = v_k[0]
+            # Project scatter onto u_k and v_k to get per-axis variances
+            var_u = (u_k @ S @ u_k).clamp_min(1e-6)
+            var_v = (v_k @ S @ v_k).clamp_min(1e-6)
+            rhos_uv[k, 0] = rho_init_scale * var_u.sqrt()
+            rhos_uv[k, 1] = rho_init_scale * var_v.sqrt()
 
         # Group SH init: mean of cluster-member SH if provided, else zeros
         if sh_init is None:
@@ -213,7 +223,9 @@ class GroupModel:
 
         self._q = nn.Parameter(centers.contiguous())
         self._m = nn.Parameter(_safe_unit(normals).contiguous())
-        self._log_rho = nn.Parameter(torch.log(rhos.clamp_min(1e-3)).contiguous())
+        self._log_rho = nn.Parameter(
+            torch.log(rhos_uv.clamp_min(1e-3)).contiguous()
+        )                                                # (K, 2)
         self._sh_grp = nn.Parameter(sh_grp.contiguous())
 
         self.grad_accum = torch.zeros(K, device=device)
@@ -254,10 +266,14 @@ class GroupModel:
         N = mu.shape[0]
         M = min(top_m, self.K)
 
-        # Pairwise squared distances (N, K).  Done in chunks if N or K large.
-        # For now: assume both fit (typical sizes: N~3e5, K~50 -> 60M floats OK)
+        # Pairwise squared distances (N, K).  This simple isotropic version
+        # is used for tests and quick clustering checks; production uses
+        # the anisotropic kernel in gms_gaussian_model.py.
         d2 = torch.cdist(mu, self._q, p=2).pow(2)        # (N, K)
-        rho2 = (self.rho.pow(2) * 2.0).unsqueeze(0)      # (1, K)
+        # rho is (K, 2); take per-group mean of u,v scales for the
+        # isotropic-equivalent radius here.
+        rho_iso = self.rho.mean(dim=-1)                  # (K,)
+        rho2 = (rho_iso.pow(2) * 2.0).unsqueeze(0)       # (1, K)
         logits = -d2 / rho2.clamp_min(1e-9)
 
         # Top-M selection along K
@@ -478,7 +494,7 @@ class GroupModel:
         # Skip groups with no mass (their S is zero)
         eligible = mass > 1e-4
         m_star = self._m.detach().clone()
-        rho_star = self.rho.detach().clone()
+        rho_star = self.rho.detach().clone()                            # (K, 2)
         if eligible.any():
             S_eli = S[eligible]
             vals, vecs = torch.linalg.eigh(S_eli)
@@ -489,11 +505,20 @@ class GroupModel:
             sign = torch.where(sign == 0, torch.ones_like(sign), sign)
             m_eli = m_eli * sign.unsqueeze(-1)
             m_star[eligible] = m_eli
-            # In-plane RMS for rho:  trace(S) - perp_var
-            tr_S = vals.sum(dim=-1)
-            perp_var = vals[:, 0]
-            in_plane_var = (tr_S - perp_var).clamp_min(1e-6)
-            rho_star[eligible] = in_plane_var.sqrt()
+
+            # Anisotropic in-plane rho: project S onto the tangent basis
+            # built from m_star (the same deterministic Gram-Schmidt basis
+            # that gather_at will use).  rho_u = sqrt(u^T S u), similarly v.
+            # IMPORTANT: use m_star, not the current m, because the basis
+            # rotates with the new normal.
+            u_eli, v_eli = _tangent_basis(m_eli)                        # (Ke, 3) each
+            # var_u_k = u_k^T S_k u_k    (Ke,)
+            S_u = (S_eli @ u_eli.unsqueeze(-1)).squeeze(-1)             # (Ke, 3)
+            var_u = (S_u * u_eli).sum(dim=-1).clamp_min(1e-6)
+            S_v = (S_eli @ v_eli.unsqueeze(-1)).squeeze(-1)
+            var_v = (S_v * v_eli).sum(dim=-1).clamp_min(1e-6)
+            rho_star[eligible, 0] = var_u.sqrt()
+            rho_star[eligible, 1] = var_v.sqrt()
 
         # Damped overwrite of geometry
         with torch.no_grad():
@@ -501,7 +526,7 @@ class GroupModel:
             self._q.copy_(new_q)
             new_m_raw = (1.0 - eta_geom) * self._m + eta_geom * m_star
             self._m.copy_(_safe_unit(new_m_raw))
-            new_rho = (1.0 - eta_geom) * self.rho + eta_geom * rho_star
+            new_rho = (1.0 - eta_geom) * self.rho + eta_geom * rho_star  # (K, 2)
             new_rho = new_rho.clamp(min=rho_min, max=rho_max)
             self._log_rho.copy_(torch.log(new_rho))
 
@@ -619,8 +644,13 @@ class GroupModel:
             m_new = _safe_unit(seed_normals.mean(dim=0))
         else:
             m_new = vecs[:, 0]                                           # smallest
-        in_plane_var = (vals[1] + vals[2]).clamp_min(1e-6)
-        rho_new = max(float(in_plane_var.sqrt().item()), rho_init)
+        # Anisotropic rho: project scatter onto Gram-Schmidt tangent basis
+        u_new, v_new = _tangent_basis(m_new.unsqueeze(0))
+        u_new = u_new[0]; v_new = v_new[0]
+        var_u = (u_new @ scatter @ u_new).clamp_min(1e-6)
+        var_v = (v_new @ scatter @ v_new).clamp_min(1e-6)
+        rho_u_new = max(float(var_u.sqrt().item()), rho_init)
+        rho_v_new = max(float(var_v.sqrt().item()), rho_init)
         sh_new = (
             seed_sh.mean(dim=0)
             if seed_sh is not None
@@ -632,11 +662,11 @@ class GroupModel:
         # also updating the optimizer (handled in Stage 2).
         self._q = nn.Parameter(torch.cat([self._q.detach(), q_new.unsqueeze(0)], dim=0))
         self._m = nn.Parameter(torch.cat([self._m.detach(), m_new.unsqueeze(0)], dim=0))
+        log_rho_new = torch.log(
+            torch.tensor([[rho_u_new, rho_v_new]], device=device)
+        )                                                                # (1, 2)
         self._log_rho = nn.Parameter(
-            torch.cat(
-                [self._log_rho.detach(), torch.log(torch.tensor([rho_new], device=device))],
-                dim=0,
-            )
+            torch.cat([self._log_rho.detach(), log_rho_new], dim=0)
         )
         self._sh_grp = nn.Parameter(
             torch.cat([self._sh_grp.detach(), sh_new.unsqueeze(0)], dim=0)

@@ -48,8 +48,12 @@ def soft_assign_anisotropic(
     """Top-M soft assignment using an anisotropic Gaussian kernel on
     (perpendicular distance to plane, in-plane distance to center).
 
-    pi_ik proportional to exp(- (m_k . (mu - q_k))^2 / (2 sigma_n^2)
-                              - ||P_k (mu - q_k)||^2 / (2 rho_k^2))
+    pi_ik proportional to exp(- (m_k . d_ik)^2 / (2 sigma_n^2)
+                              - (u_k . d_ik)^2 / (2 rho_u_k^2)
+                              - (v_k . d_ik)^2 / (2 rho_v_k^2))
+    where d_ik = mu_i - q_k, and (u_k, v_k) are the Gram-Schmidt tangent
+    basis built from m_k (cached in the group model).  rho_u, rho_v are
+    per-group, per-axis in-plane scales.
 
     Memory-bounded by chunking over primitives.  Peak intermediate tensor
     is (chunk_size, K, 3), not (N, K, 3).
@@ -61,9 +65,7 @@ def soft_assign_anisotropic(
     top_m : int
     sigma_n : float
     chunk_size : int
-        Primitives per chunk.  Default 65536 keeps peak intermediate at
-        ~1 GiB even with K = 1000 (1024*65536*3*4 = ~768 MiB; the inner
-        ops materialize 2-3 copies so plan for ~2-3x).
+        Primitives per chunk.
 
     Returns
     -------
@@ -79,9 +81,17 @@ def soft_assign_anisotropic(
 
     q = group_model.q                                  # (K, 3)
     m_k = group_model.m                                # (K, 3) unit
-    rho_k = group_model.rho                            # (K,)
+    rho_uv = group_model.rho                           # (K, 2): (rho_u, rho_v)
+    # Ensure tangent basis is cached and use it directly to avoid
+    # recomputing Gram-Schmidt per chunk
+    if (getattr(group_model, '_u_cache', None) is None
+            or group_model._u_cache.shape[0] != K):
+        group_model._refresh_tangent_basis()
+    u_k = group_model._u_cache                         # (K, 3)
+    v_k = group_model._v_cache                         # (K, 3)
     inv_2sn2 = 1.0 / (2.0 * sigma_n ** 2 + 1e-12)
-    inv_2rho2 = 1.0 / (2.0 * rho_k.pow(2) + 1e-12)     # (K,)
+    inv_2rho_u2 = 1.0 / (2.0 * rho_uv[:, 0].pow(2) + 1e-12)  # (K,)
+    inv_2rho_v2 = 1.0 / (2.0 * rho_uv[:, 1].pow(2) + 1e-12)  # (K,)
 
     pi_out = torch.empty(N, M, device=device, dtype=dtype)
     idx_out = torch.empty(N, M, device=device, dtype=torch.long)
@@ -92,15 +102,15 @@ def soft_assign_anisotropic(
         mu_chunk = mu[start:end]                                  # (C, 3)
         # (C, K, 3) -- this is the big tensor; chunked
         diff = mu_chunk.unsqueeze(1) - q.unsqueeze(0)
+        # Project diff onto each group's (m, u, v) axes
         perp = (diff * m_k.unsqueeze(0)).sum(dim=-1)              # (C, K)
-        # ||diff||^2 - perp^2 = in-plane squared distance
-        d2 = diff.pow(2).sum(dim=-1)                              # (C, K)
-        del diff                                                  # release early
-        in_plane_sq = (d2 - perp.pow(2)).clamp_min(0.0)
-        del d2
+        d_u  = (diff * u_k.unsqueeze(0)).sum(dim=-1)              # (C, K)
+        d_v  = (diff * v_k.unsqueeze(0)).sum(dim=-1)              # (C, K)
+        del diff
         logits = -(perp.pow(2) * inv_2sn2
-                   + in_plane_sq * inv_2rho2.unsqueeze(0))
-        del perp, in_plane_sq
+                   + d_u.pow(2) * inv_2rho_u2.unsqueeze(0)
+                   + d_v.pow(2) * inv_2rho_v2.unsqueeze(0))
+        del perp, d_u, d_v
 
         top_vals, top_idx = torch.topk(logits, k=M, dim=1)        # (C, M)
         del logits
@@ -798,6 +808,8 @@ class GMSGaussianModel(GaussianModel):
 
             # Spatial clustering: union-find with radius = seed_radius_frac
             # times the median group rho (scene-scale heuristic)
+            # Use overall median of rho (across groups AND both u,v axes)
+            # for a scene-scale heuristic.
             radius = seed_radius_frac * gm.rho.median().item()
             n_born = self._birth_from_orphan_positions(
                 orphan_pts, radius=radius,

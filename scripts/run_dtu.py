@@ -5,7 +5,7 @@ scenes = [65]
 data_base_path='/workspace/colmap_scenes/DTU/dtu'
 out_base_path='/workspace/colmap_scenes/DTU/dtu_output'
 eval_path='/workspace/colmap_scenes/DTU/dtu_eval'
-out_name='gms_C1'
+out_name='gms'
 gpu_id=0
 
 for scene in scenes:
@@ -16,21 +16,22 @@ for scene in scenes:
     common_args = "--quiet -r2 --ncc_scale 0.5"
     # common_args = "-r2 --ncc_scale 0.5 --use_gms"
     
-    # --- Config 1: REFERENCE (current setting that gave CD=0.36 on scan24) -----
-    # common_args = "-r2 --ncc_scale 0.5 --use_gms --gms_position_mode free --gms_appearance_mode group --gms_normal_mode rotation --gms_lambda_align 1e-2 --gms_lambda_plane 0"
+    # Server 1: C2 baseline with NEW anisotropic rho (compare against old 0.537)
+    # common_args = "-r2 --ncc_scale 0.5 --use_gms --gms_position_mode free --gms_appearance_mode group --gms_normal_mode rotation --gms_lambda_align 5e-2 --gms_lambda_plane 0 --gms_top_m 4"
+    # scan65 -> out_name = gms_C2_aniso_topm4
     
-    # --- Config 2: STRONGER ALIGNMENT (does cranking alignment improve CD?) ---
-    # common_args = "-r2 --ncc_scale 0.5 --use_gms --gms_position_mode free --gms_appearance_mode group --gms_normal_mode rotation --gms_lambda_align 5e-2 --gms_lambda_plane 0"
+    # Server 2: Hard assignment with anisotropic rho
+    # common_args = "-r2 --ncc_scale 0.5 --use_gms --gms_position_mode free --gms_appearance_mode group --gms_normal_mode rotation --gms_lambda_align 5e-2 --gms_lambda_plane 0 --gms_top_m 1"
+    # scan65 -> out_name = gms_aniso_topm1
     
-    # --- Config 3: PLANE LOSS (does the new direct-geometric prior help?) ----
-    # common_args = "-r2 --ncc_scale 0.5 --use_gms --gms_position_mode free --gms_appearance_mode group --gms_normal_mode rotation --gms_lambda_align 1e-2 --gms_lambda_plane 1e-2"
+    # Server 3: Soft, narrower (compromise)
+    # common_args = "-r2 --ncc_scale 0.5 --use_gms --gms_position_mode free --gms_appearance_mode group --gms_normal_mode rotation --gms_lambda_align 5e-2 --gms_lambda_plane 0 --gms_top_m 2"
+    # scan65 -> out_name = gms_aniso_topm2
     
-    # --- Config 4: BOTH STRONGER (interaction between alignment + plane) ------
-    # common_args = "-r2 --ncc_scale 0.5 --use_gms --gms_position_mode free --gms_appearance_mode group --gms_normal_mode rotation --gms_lambda_align 5e-2 --gms_lambda_plane 5e-2"
-    
-    # --- Config 5: FLOOR (alignment + plane off; ablation = ~PGSR + group overhead)
-    # common_args = "-r2 --ncc_scale 0.5 --use_gms --gms_position_mode free --gms_appearance_mode group --gms_normal_mode rotation --gms_lambda_align 0 --gms_lambda_plane 0"
-    
+    # Server 4: Best config on a scene with strong elongation
+    # common_args = "-r2 --ncc_scale 0.5 --use_gms --gms_position_mode free --gms_appearance_mode group --gms_normal_mode rotation --gms_lambda_align 5e-2 --gms_lambda_plane 0 --gms_top_m 4"
+    # scan37 -> out_name = gms_C2_aniso_topm4
+        
     cmd = f'CUDA_VISIBLE_DEVICES={gpu_id} python train.py -s {data_base_path}/scan{scene} -m {out_base_path}/dtu_scan{scene}/{out_name} {common_args}'
     print(cmd)
     os.system(cmd)
