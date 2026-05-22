@@ -359,6 +359,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 lambda_d=args.gms_lambda_d,
                 lambda_rho=args.gms_lambda_rho,
                 lambda_align=args.gms_lambda_align,
+                lambda_plane=args.gms_lambda_plane,
             )
             loss = loss + gms_aux
 
@@ -587,6 +588,11 @@ if __name__ == "__main__":
     parser.add_argument("--gms_lambda_align", type=float, default=1e-2,
                         help="Weight for the normal-alignment loss (only active when "
                              "--gms_normal_mode rotation).  0 disables.")
+    parser.add_argument("--gms_lambda_plane", type=float, default=0.0,
+                        help="Weight for the position-plane soft prior: pulls each "
+                             "primitive toward its group's plane in 3D position. "
+                             "Direct geometric influence of groups on positions. "
+                             "0 disables (default).")
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
