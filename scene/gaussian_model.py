@@ -9,29 +9,27 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
-import torch
-import numpy as np
-from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation, build_scaling
-from torch import nn
 import os
-from utils.system_utils import mkdir_p
+import numpy as np
+import torch
+import torch.nn as nn
+
 from plyfile import PlyData, PlyElement
-from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
+
+from utils.general_utils import (
+    build_scaling_rotation,
+    build_rotation,
+    inverse_sigmoid,
+    get_expon_lr_func,
+    strip_symmetric,
+)
 from utils.graphics_utils import BasicPointCloud
-from utils.general_utils import strip_symmetric, build_scaling_rotation
+from utils.sh_utils import RGB2SH
+from utils.system_utils import mkdir_p
 
-def dilate(bin_img, ksize=5):
-    pad = (ksize - 1) // 2
-    bin_img = torch.nn.functional.pad(bin_img, pad=[pad, pad, pad, pad], mode='reflect')
-    out = torch.nn.functional.max_pool2d(bin_img, kernel_size=ksize, stride=1, padding=0)
-    return out
+#----------------------------------------------------------------------------
 
-def erode(bin_img, ksize=5):
-    out = 1 - dilate(1 - bin_img, ksize)
-    return out
-
-# https://github.com/facebookresearch/pytorch3d/blob/b6a77ad7aaf41ed90fca80ce6a2bac3c462a7881/pytorch3d/transforms/rotation_conversions.py#L43
 def quaternion_to_matrix(quaternions: torch.Tensor) -> torch.Tensor:
     """
     Convert rotations given as quaternions to rotation matrices.
@@ -61,6 +59,18 @@ def quaternion_to_matrix(quaternions: torch.Tensor) -> torch.Tensor:
         -1,
     )
     return o.reshape(quaternions.shape[:-1] + (3, 3))
+
+def dilate(bin_img, ksize=5):
+    pad = (ksize - 1) // 2
+    bin_img = torch.nn.functional.pad(bin_img, pad=[pad, pad, pad, pad], mode='reflect')
+    out = torch.nn.functional.max_pool2d(bin_img, kernel_size=ksize, stride=1, padding=0)
+    return out
+
+def erode(bin_img, ksize=5):
+    out = 1 - dilate(1 - bin_img, ksize)
+    return out
+
+#----------------------------------------------------------------------------
 
 class GaussianModel:
 
@@ -126,22 +136,23 @@ class GaussianModel:
         )
     
     def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-        self._xyz, 
-        self._knn_f,
-        self._features_dc, 
-        self._features_rest,
-        self._scaling, 
-        self._rotation, 
-        self._opacity,
-        self.max_radii2D, 
-        self.max_weight,
-        xyz_gradient_accum, 
-        xyz_gradient_accum_abs,
-        denom,
-        denom_abs,
-        opt_dict, 
-        self.spatial_lr_scale,
+        (
+            self.active_sh_degree, 
+            self._xyz, 
+            self._knn_f,
+            self._features_dc, 
+            self._features_rest,
+            self._scaling, 
+            self._rotation, 
+            self._opacity,
+            self.max_radii2D, 
+            self.max_weight,
+            xyz_gradient_accum, 
+            xyz_gradient_accum_abs,
+            denom,
+            denom_abs,
+            opt_dict, 
+            self.spatial_lr_scale,
         ) = model_args
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
@@ -151,22 +162,22 @@ class GaussianModel:
         self.optimizer.load_state_dict(opt_dict)
 
     @property
+    def get_xyz(self):
+        return self._xyz
+
+    @property
+    def get_features(self):
+        features_dc = self._features_dc
+        features_rest = self._features_rest
+        return torch.cat((features_dc, features_rest), dim=1)
+
+    @property
     def get_scaling(self):
         return self.scaling_activation(self._scaling)
         
     @property
     def get_rotation(self):
         return self.rotation_activation(self._rotation)
-    
-    @property
-    def get_xyz(self):
-        return self._xyz
-    
-    @property
-    def get_features(self):
-        features_dc = self._features_dc
-        features_rest = self._features_rest
-        return torch.cat((features_dc, features_rest), dim=1)
     
     @property
     def get_opacity(self):
@@ -584,4 +595,5 @@ class GaussianModel:
         T = torch.tensor(fov_camera.T).float().cuda()
         pts = (pts-T)@R.transpose(-1,-2)
         return pts
-    
+
+#----------------------------------------------------------------------------

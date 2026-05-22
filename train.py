@@ -20,6 +20,7 @@ from utils.graphics_utils import patch_offsets, patch_warp
 from gaussian_renderer import render, network_gui
 import sys, time
 from scene import Scene, GaussianModel
+from scene.gms_gaussian_model import GMSGaussianModel
 from utils.general_utils import safe_state
 import cv2
 import uuid
@@ -78,7 +79,7 @@ def gen_virtul_cam(cam, trans_noise=1.0, deg_noise=15.0):
                         preload_img=False, data_device = "cuda")
     return virtul_cam
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, args=None):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     # backup main code
@@ -93,9 +94,30 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     cmd = f'cp -rf ./utils {dataset.model_path}/'
     os.system(cmd)
 
-    gaussians = GaussianModel(dataset.sh_degree)
+    gaussians = (GMSGaussianModel(dataset.sh_degree)
+                 if getattr(args, "use_gms", False)
+                 else GaussianModel(dataset.sh_degree))
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
+
+    # ---- GMS init AFTER training_setup ----
+    # The optimizer must already exist before we register group params with it.
+    if getattr(args, "use_gms", False):
+        n_sfm = gaussians.get_xyz.shape[0]
+        K_init = max(args.gms_K_init_min,
+                     int(n_sfm * args.gms_K_init_ratio))
+        print(f"[GMS] enabling groups: K_init = {K_init} for {n_sfm} primitives, "
+              f"normal_mode={args.gms_normal_mode}, "
+              f"position_mode={args.gms_position_mode}, "
+              f"appearance_mode={args.gms_appearance_mode}")
+        gaussians.enable_groups(
+            K_init=K_init,
+            top_m=args.gms_top_m,
+            sigma_n=args.gms_sigma_n,
+            normal_mode=args.gms_normal_mode,
+            position_mode=args.gms_position_mode,
+            appearance_mode=args.gms_appearance_mode,
+        )
 
     app_model = AppModel()
     app_model.train()
@@ -329,6 +351,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             ncc_loss = ncc_weight * ncc.mean()
                             loss += ncc_loss
 
+        # ---- GMS auxiliary losses ----
+        if getattr(args, "use_gms", False) and gaussians.use_groups:
+            gms_aux = gaussians.get_group_aux_losses(
+                lambda_h=args.gms_lambda_h,
+                lambda_r=args.gms_lambda_r,
+                lambda_d=args.gms_lambda_d,
+                lambda_rho=args.gms_lambda_rho,
+                lambda_align=args.gms_lambda_align,
+            )
+            loss = loss + gms_aux
+
         loss.backward()
         iter_end.record()
 
@@ -365,10 +398,36 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 viewspace_point_tensor_abs = render_pkg["viewspace_points_abs"]
                 gaussians.add_densification_stats(viewspace_point_tensor, viewspace_point_tensor_abs, visibility_filter)
 
+                # ---- GMS: accumulate per-group statistics (G_k, M_k) ----
+                # Uses the viewspace-points gradient norm as g_i, lifted to
+                # group-level via the soft assignment.  Analogous to 3DGS's
+                # densification trigger but at the group abstraction.
+                if getattr(args, "use_gms", False) and gaussians.use_groups:
+                    with torch.no_grad():
+                        if viewspace_point_tensor.grad is not None:
+                            g_i = torch.norm(viewspace_point_tensor.grad[:, :2], dim=-1)
+                            pi = gaussians._get_assignment()
+                            idx = gaussians._topk_idx
+                            g_i_masked = torch.where(
+                                visibility_filter, g_i, torch.zeros_like(g_i)
+                            )
+                            gaussians.group_model.accumulate_stats(pi, idx, g_i_masked)
+
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, opt.densify_abs_grad_threshold, 
                                                 opt.opacity_cull_threshold, scene.cameras_extent, size_threshold)
+
+                    # ---- GMS: adaptive group birth/death AFTER primitive
+                    # densification (new primitives are in place and their
+                    # xi/h have been set by cat_tensors_to_optimizer).
+                    if getattr(args, "use_gms", False) and gaussians.use_groups:
+                        n_born, n_died = gaussians.adaptive_group_population(
+                            current_iter=iteration,
+                        )
+                        if n_born or n_died:
+                            print(f"[GMS iter {iteration}] groups: "
+                                  f"+{n_born} -{n_died}, K = {gaussians.group_model.K}")
             
             # multi-view observe trim
             if opt.use_multi_view_trim and iteration % 1000 == 0 and iteration < opt.densify_until_iter:
@@ -386,6 +445,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration < opt.densify_until_iter:
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
+
+            # ---- GMS: E-step at fixed cadence after warmup ----
+            if (getattr(args, "use_gms", False)
+                    and gaussians.use_groups
+                    and iteration > args.gms_T_warm
+                    and iteration % args.gms_T_E == 0):
+                gaussians.e_step_update()
 
             # Optimizer step
             if iteration < opt.iterations:
@@ -483,6 +549,45 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+
+    # ---- GMS arguments ----
+    parser.add_argument("--use_gms", action="store_true", default=False,
+                        help="Enable Grouped Manifold Splatting.")
+    parser.add_argument("--gms_K_init_ratio", type=float, default=1.0 / 200.0,
+                        help="K_init = N_SfM * this ratio.  Default: 1/200.")
+    parser.add_argument("--gms_K_init_min", type=int, default=8,
+                        help="Floor for K_init regardless of SfM size.")
+    parser.add_argument("--gms_top_m", type=int, default=4,
+                        help="Top-M nearest groups per primitive.")
+    parser.add_argument("--gms_sigma_n", type=float, default=0.05,
+                        help="Perpendicular bandwidth for soft-assign kernel (scene units).")
+    parser.add_argument("--gms_T_E", type=int, default=500,
+                        help="Run an E-step every T_E iterations.")
+    parser.add_argument("--gms_T_warm", type=int, default=3000,
+                        help="Skip E-step until T_warm iterations have passed.")
+    parser.add_argument("--gms_lambda_h", type=float, default=1e-3)
+    parser.add_argument("--gms_lambda_r", type=float, default=1e-3)
+    parser.add_argument("--gms_lambda_d", type=float, default=1e-2)
+    parser.add_argument("--gms_lambda_rho", type=float, default=1e-4)
+    parser.add_argument("--gms_normal_mode", type=str, default="rotation",
+                        choices=["group", "rotation"],
+                        help="'group': override get_normal with pi-weighted group normals. "
+                             "'rotation' (recommended): use PGSR's smallest-axis normal "
+                             "+ soft alignment loss.")
+    parser.add_argument("--gms_position_mode", type=str, default="group",
+                        choices=["group", "free"],
+                        help="'group': position derived from chart coords (Eq. 6). "
+                             "'free': _xyz remains a free parameter (PGSR). "
+                             "Ablation flag.")
+    parser.add_argument("--gms_appearance_mode", type=str, default="group",
+                        choices=["group", "free"],
+                        help="'group': c_i = sum_k pi_ik c^grp_k + c^res_i. "
+                             "'free': group SH disabled, c_i = c^res_i (PGSR). "
+                             "Ablation flag.")
+    parser.add_argument("--gms_lambda_align", type=float, default=1e-2,
+                        help="Weight for the normal-alignment loss (only active when "
+                             "--gms_normal_mode rotation).  0 disables.")
+
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -494,7 +599,7 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     # network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args=args)
 
     # All done
     print("\nTraining complete.")

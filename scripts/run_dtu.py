@@ -1,23 +1,23 @@
 import os
 
 # scenes = [24, 37, 40, 55, 63, 65, 69, 83, 97, 105, 106, 110, 114, 118, 122]
-scenes = [24, 37, 40]
+scenes = [24]
 data_base_path='/workspace/colmap_scenes/DTU/dtu'
 out_base_path='/workspace/colmap_scenes/DTU/dtu_output'
 eval_path='/workspace/colmap_scenes/DTU/dtu_eval'
-out_name='debug'
+out_name='gms'
 gpu_id=0
 
 for scene in scenes:
-    # cmd = f'rm -rf {out_base_path}/dtu_scan{scene}/{out_name}/*'
-    # print(cmd)
-    # os.system(cmd)
-
-    # cmd = f'cp -rf {data_base_path}/scan{scene}/sparse/0/* {data_base_path}/scan{scene}/sparse/'
-    # print(cmd)
-    # os.system(cmd)
+    cmd = f'rm -rf {out_base_path}/dtu_scan{scene}/{out_name}/*'
+    print(cmd)
+    os.system(cmd)
 
     common_args = "--quiet -r2 --ncc_scale 0.5"
+    common_args = "-r2 --ncc_scale 0.5 --use_gms"
+    # common_args += " --gms_position_mode free --gms_appearance_mode free --gms_lambda_align 0 --gms_normal_mode rotation"
+    # common_args += " --gms_position_mode group --gms_appearance_mode free --gms_lambda_align 0 --gms_normal_mode rotation"
+    common_args += " --gms_position_mode free --gms_appearance_mode group --gms_lambda_align 0 --gms_normal_mode rotation"
     cmd = f'CUDA_VISIBLE_DEVICES={gpu_id} python train.py -s {data_base_path}/scan{scene} -m {out_base_path}/dtu_scan{scene}/{out_name} {common_args}'
     print(cmd)
     os.system(cmd)
