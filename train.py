@@ -283,9 +283,32 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     image_weight = image_weight.detach().cpu().numpy()
                     image_weight = (image_weight * 255).clip(0, 255).astype(np.uint8)
                     image_weight_color = cv2.applyColorMap(image_weight, cv2.COLORMAP_JET)
+
+                    # GMS: group-segmentation panel (each primitive in its
+                    # dominant group's palette color).  Falls back to a gray
+                    # placeholder when groups aren't enabled.
+                    if getattr(args, "use_gms", False) and gaussians.use_groups:
+                        seg_show = gaussians.render_group_segmentation(
+                            render, viewpoint_cam, pipe, background,
+                            app_model=app_model,
+                            return_to_uint8=True,
+                        )
+                    else:
+                        seg_show = np.full(
+                            (H, W, 3), 128, dtype=np.uint8
+                        )
+
                     row0 = np.concatenate([gt_img_show, img_show, normal_show, distance_color], axis=1)
                     row1 = np.concatenate([d_mask_show_color, depth_color, depth_normal_show, image_weight_color], axis=1)
-                    image_to_show = np.concatenate([row0, row1], axis=0)
+                    # Third row: group segmentation (single panel, centered visually)
+                    row2 = np.concatenate(
+                        [seg_show,
+                         np.full((H, W, 3), 0, dtype=np.uint8),
+                         np.full((H, W, 3), 0, dtype=np.uint8),
+                         np.full((H, W, 3), 0, dtype=np.uint8)],
+                        axis=1,
+                    )
+                    image_to_show = np.concatenate([row0, row1, row2], axis=0)
                     cv2.imwrite(os.path.join(debug_path, "%05d"%iteration + "_" + viewpoint_cam.image_name + ".jpg"), image_to_show)
 
                 if d_mask.sum() > 0:

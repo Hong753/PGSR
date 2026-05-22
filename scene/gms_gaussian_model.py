@@ -90,8 +90,15 @@ def soft_assign_anisotropic(
     u_k = group_model._u_cache                         # (K, 3)
     v_k = group_model._v_cache                         # (K, 3)
     inv_2sn2 = 1.0 / (2.0 * sigma_n ** 2 + 1e-12)
-    inv_2rho_u2 = 1.0 / (2.0 * rho_uv[:, 0].pow(2) + 1e-12)  # (K,)
-    inv_2rho_v2 = 1.0 / (2.0 * rho_uv[:, 1].pow(2) + 1e-12)  # (K,)
+    # Kernel: exp(-r_u^2 / (4 rho_u^2) - r_v^2 / (4 rho_v^2))
+    # The factor 4 (rather than 2) is chosen so that for an isotropic
+    # group with rho_u = rho_v = rho, the effective in-plane decay rate
+    # matches the isotropic kernel exp(-||r_perp||^2 / (4 rho^2))
+    # that was previously used with rho^2 = rho_u^2 + rho_v^2.
+    # This preserves the per-group "extent" interpretation across the
+    # isotropic-to-anisotropic refactor.
+    inv_4rho_u2 = 1.0 / (4.0 * rho_uv[:, 0].pow(2) + 1e-12)  # (K,)
+    inv_4rho_v2 = 1.0 / (4.0 * rho_uv[:, 1].pow(2) + 1e-12)  # (K,)
 
     pi_out = torch.empty(N, M, device=device, dtype=dtype)
     idx_out = torch.empty(N, M, device=device, dtype=torch.long)
@@ -108,8 +115,8 @@ def soft_assign_anisotropic(
         d_v  = (diff * v_k.unsqueeze(0)).sum(dim=-1)              # (C, K)
         del diff
         logits = -(perp.pow(2) * inv_2sn2
-                   + d_u.pow(2) * inv_2rho_u2.unsqueeze(0)
-                   + d_v.pow(2) * inv_2rho_v2.unsqueeze(0))
+                   + d_u.pow(2) * inv_4rho_u2.unsqueeze(0)
+                   + d_v.pow(2) * inv_4rho_v2.unsqueeze(0))
         del perp, d_u, d_v
 
         top_vals, top_idx = torch.topk(logits, k=M, dim=1)        # (C, M)
@@ -1111,6 +1118,170 @@ class GMSGaussianModel(GaussianModel):
     # ------------------------------------------------------------------ #
     #  Save_ply bake -- write GMS-derived values into PGSR-native slots   #
     # ------------------------------------------------------------------ #
+    @torch.no_grad()
+    # ------------------------------------------------------------------ #
+    #  Group-segmentation visualization (for debug images during training) #
+    # ------------------------------------------------------------------ #
+    @torch.no_grad()
+    def make_group_segmentation_sh(self, palette: torch.Tensor | None = None
+                                   ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (features_dc, features_rest) tensors that, if substituted
+        into this model, would render each primitive in a constant color
+        corresponding to its dominant (argmax-pi) group.
+
+        Used to render a "group segmentation" panel showing which primitive
+        belongs to which group.  Does NOT modify any model state.
+
+        Parameters
+        ----------
+        palette : (K_max, 3) tensor or None
+            Per-group RGB colors in [0, 1].  If None, a deterministic HSV
+            palette is generated.  K_max should be at least current K.
+
+        Returns
+        -------
+        seg_dc : (N, 1, 3) tensor, SH DC coefficients for constant color
+        seg_rest : (N, B-1, 3) tensor of zeros, no higher-order SH
+        """
+        assert self.use_groups
+        N = self._xi.shape[0]
+        K = self.group_model.K
+        device = self._xi.device
+
+        # Dominant group for each primitive (argmax over top-M pi)
+        pi = self._get_assignment()                                # (N, M)
+        max_pi_idx = pi.argmax(dim=1, keepdim=True)                # (N, 1)
+        # The top-M groups for each primitive are in _topk_idx
+        dom_group = self._topk_idx.gather(1, max_pi_idx).squeeze(1)  # (N,)
+
+        # Build / use palette
+        if palette is None:
+            palette = self._default_palette(K, device=device)
+        else:
+            assert palette.shape[1] == 3
+            assert palette.shape[0] >= K, \
+                f"palette has {palette.shape[0]} colors but K={K}"
+
+        # Color per primitive
+        prim_color = palette[dom_group % palette.shape[0]]          # (N, 3) in [0,1]
+
+        # Convert RGB color to SH DC.  PGSR uses the standard convention
+        # where the DC coefficient is color / (2 * sqrt(pi)) so that the
+        # constant SH evaluation at the unit sphere returns the color.
+        # (2*sqrt(pi))^{-1} = 0.282094791...
+        SH_C0 = 0.28209479177387814
+        # The PGSR rendering applies a "+0.5" offset:
+        #   color = SH_C0 * dc + 0.5
+        # So to render a target color c, we want dc = (c - 0.5) / SH_C0.
+        seg_dc = ((prim_color - 0.5) / SH_C0).unsqueeze(1)         # (N, 1, 3)
+
+        # Zero out higher-order SH so the rendered color is view-independent
+        seg_rest = torch.zeros_like(self._features_rest)           # (N, B-1, 3)
+
+        return seg_dc, seg_rest
+
+    @staticmethod
+    def _default_palette(K: int, device='cpu') -> torch.Tensor:
+        """Generate K visually distinct colors using HSV with golden-angle hue."""
+        # Golden-angle hue stepping keeps adjacent indices visually distinct
+        golden_ratio_conj = 0.6180339887498949
+        hues = (torch.arange(K, device=device, dtype=torch.float32) * golden_ratio_conj) % 1.0
+        # Constant saturation and value give bright, distinguishable colors
+        s = torch.full((K,), 0.85, device=device)
+        v = torch.full((K,), 0.95, device=device)
+        # HSV -> RGB conversion
+        h6 = hues * 6.0
+        i = h6.floor().long() % 6
+        f = h6 - h6.floor()
+        p = v * (1.0 - s)
+        q = v * (1.0 - s * f)
+        t = v * (1.0 - s * (1.0 - f))
+        # Build RGB based on i
+        rgb = torch.zeros(K, 3, device=device)
+        rgb[i == 0] = torch.stack([v, t, p], dim=-1)[i == 0]
+        rgb[i == 1] = torch.stack([q, v, p], dim=-1)[i == 1]
+        rgb[i == 2] = torch.stack([p, v, t], dim=-1)[i == 2]
+        rgb[i == 3] = torch.stack([p, q, v], dim=-1)[i == 3]
+        rgb[i == 4] = torch.stack([t, p, v], dim=-1)[i == 4]
+        rgb[i == 5] = torch.stack([v, p, q], dim=-1)[i == 5]
+        return rgb
+
+    @torch.no_grad()
+    def render_group_segmentation(self, render_fn, viewpoint_cam, pipe, bg,
+                                  app_model=None, return_to_uint8: bool = True):
+        """Render the scene with each primitive in its dominant group's color.
+
+        Parameters
+        ----------
+        render_fn : callable
+            The PGSR render function (typically gaussian_renderer.render).
+        viewpoint_cam : Camera
+        pipe : pipeline params
+        bg : background color tensor
+        app_model : optional appearance model (passed through to render_fn)
+        return_to_uint8 : bool
+            If True, returns a HxWx3 uint8 numpy array in BGR (cv2 convention).
+            If False, returns the raw render output dict.
+
+        Returns
+        -------
+        image (uint8 BGR ndarray) or render output dict
+        """
+        if not self.use_groups or self.group_model is None:
+            # Return a placeholder gray image
+            if return_to_uint8:
+                import numpy as np
+                H = int(viewpoint_cam.image_height)
+                W = int(viewpoint_cam.image_width)
+                return np.full((H, W, 3), 128, dtype=np.uint8)
+            return None
+
+        # Snapshot SH state
+        orig_dc = self._features_dc
+        orig_rest = self._features_rest
+        orig_grp_sh = self.group_model._sh_grp
+
+        # Compute segmentation SH
+        seg_dc, seg_rest = self.make_group_segmentation_sh()
+
+        # Temporarily swap.  Use nn.Parameter wrapping to match what render
+        # paths might expect.
+        self._features_dc = nn.Parameter(seg_dc.contiguous(),
+                                         requires_grad=False)
+        self._features_rest = nn.Parameter(seg_rest.contiguous(),
+                                           requires_grad=False)
+        # Zero out group SH so it doesn't contribute
+        self.group_model._sh_grp = nn.Parameter(
+            torch.zeros_like(orig_grp_sh), requires_grad=False
+        )
+
+        try:
+            if app_model is not None:
+                out = render_fn(viewpoint_cam, self, pipe, bg, app_model=app_model)
+            else:
+                out = render_fn(viewpoint_cam, self, pipe, bg)
+        finally:
+            # ALWAYS restore
+            self._features_dc = orig_dc
+            self._features_rest = orig_rest
+            self.group_model._sh_grp = orig_grp_sh
+            self._invalidate_cache()
+
+        if not return_to_uint8:
+            return out
+
+        # Convert rendered tensor to BGR uint8 (cv2 convention)
+        import numpy as np
+        img = out['render'] if 'render' in out else out.get('app_image', None)
+        if img is None:
+            H = int(viewpoint_cam.image_height)
+            W = int(viewpoint_cam.image_width)
+            return np.full((H, W, 3), 128, dtype=np.uint8)
+        # img: (3, H, W) tensor
+        img_bgr = (img.permute(1, 2, 0).clamp(0, 1)[:, :, [2, 1, 0]]
+                   * 255).detach().cpu().numpy().astype(np.uint8)
+        return img_bgr
+
     @torch.no_grad()
     def save_ply(self, path, mask=None):
         """Save a PGSR-compatible .ply with GMS-derived values baked in.
