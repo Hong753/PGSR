@@ -15,15 +15,9 @@ for scene in scenes:
 
     common_args = "--quiet -r2 --ncc_scale 0.5"
     # common_args = "-r2 --ncc_scale 0.5 --use_gms"
-    # Server 1: Curvature ON, surface-aware OFF (sigma_theta=0)
-    # Tests whether surface-aware kernel is the problem
-    common_args = "-r2 --ncc_scale 0.5 --use_gms --gms_position_mode free --gms_appearance_mode group --gms_normal_mode rotation --gms_lambda_align 5e-2 --gms_lambda_surf 1e-2 --gms_lambda_curv 1e-4 --gms_top_m 4 --gms_sigma_theta 0"
-    # out_name = "gms_curv_no_surfaware"
     
-    # Server 2: Curvature ON, lambda_surf=0
-    # Tests whether surface position loss is hurting
-    common_args = "-r2 --ncc_scale 0.5 --use_gms --gms_position_mode free --gms_appearance_mode group --gms_normal_mode rotation --gms_lambda_align 5e-2 --gms_lambda_surf 0 --gms_lambda_curv 1e-4 --gms_top_m 4 --gms_sigma_theta 0.3"
-    # out_name = "gms_curv_no_surfloss"
+    # C2 isotropic — our best measured
+    common_args = "-r2 --ncc_scale 0.5 --use_gms --gms_position_mode free --gms_appearance_mode group --gms_normal_mode rotation --gms_lambda_align 5e-2 --gms_lambda_plane 0 --gms_top_m 4"
         
     cmd = f'CUDA_VISIBLE_DEVICES={gpu_id} python train.py -s {data_base_path}/scan{scene} -m {out_base_path}/dtu_scan{scene}/{out_name} {common_args}'
     print(cmd)
