@@ -117,6 +117,20 @@ class GroupModel:
         return torch.exp(self._log_rho)
 
     @property
+    def H(self) -> torch.Tensor:
+        """Curvature tensor per group as a (K, 2, 2) symmetric matrix.
+        Packed storage is (K, 3) = (Huu, Huv, Hvv).
+        Initialized to zero (flat groups); updated by E-step."""
+        H_packed = self._H                                # (K, 3)
+        # Build full (K, 2, 2) symmetric matrix
+        H_mat = torch.zeros(self.K, 2, 2, device=H_packed.device, dtype=H_packed.dtype)
+        H_mat[:, 0, 0] = H_packed[:, 0]
+        H_mat[:, 1, 1] = H_packed[:, 2]
+        H_mat[:, 0, 1] = H_packed[:, 1]
+        H_mat[:, 1, 0] = H_packed[:, 1]
+        return H_mat
+
+    @property
     def sh_grp(self) -> torch.Tensor:
         return self._sh_grp
 
@@ -226,6 +240,12 @@ class GroupModel:
         self._log_rho = nn.Parameter(
             torch.log(rhos_uv.clamp_min(1e-3)).contiguous()
         )                                                # (K, 2)
+        # Curvature tensor H_k in {Huu, Huv, Hvv} packed form (K, 3).
+        # Initialized to zero (flat groups).  Updated by E-step via
+        # least-squares quadric fit to assigned primitives.
+        self._H = nn.Parameter(
+            torch.zeros(K, 3, device=device).contiguous()
+        )
         self._sh_grp = nn.Parameter(sh_grp.contiguous())
 
         self.grad_accum = torch.zeros(K, device=device)
@@ -326,8 +346,10 @@ class GroupModel:
             self._refresh_tangent_basis()
         u_top = self._u_cache[idx]                        # (N, M, 3)
         v_top = self._v_cache[idx]                        # (N, M, 3)
+        H_top = self._H[idx]                              # (N, M, 3) packed
 
-        return dict(q=q_top, m=m_top, rho=rho_top, sh=sh_top, u=u_top, v=v_top)
+        return dict(q=q_top, m=m_top, rho=rho_top, sh=sh_top,
+                    u=u_top, v=v_top, H=H_top)
 
     # ------------------------------------------------------------------ #
     #  Chart-coordinate projection                                        #
@@ -530,6 +552,81 @@ class GroupModel:
             new_rho = new_rho.clamp(min=rho_min, max=rho_max)
             self._log_rho.copy_(torch.log(new_rho))
 
+        # Curvature update: least-squares quadric fit to assigned primitives.
+        # We fit h_i = 1/2 xi^T H xi + c, where c is a per-group constant
+        # that absorbs the centroid offset caused by q_star being a
+        # *position* centroid (whereas the surface-parameterization origin
+        # should be the point of zero quadric height).  Without the c
+        # term, the offset would systematically bias H toward zero for
+        # convex surfaces (E[z] > 0 if H positive definite).
+        #
+        # Pack as h_i = [0.5 xi_u^2, xi_u*xi_v, 0.5 xi_v^2, 1] . [Huu, Huv, Hvv, c]
+        # Solve 4x4 normal equations per group, then discard c.
+        H_star = self._H.detach().clone()                              # (K, 3)
+        if eligible.any():
+            # Compute new tangent basis from m_star for the eligible groups
+            u_full = self._u_cache if self._u_cache is not None else None
+            if u_full is None or u_full.shape[0] != self.K:
+                self._refresh_tangent_basis()
+                u_full = self._u_cache
+            v_full = self._v_cache
+            # Use NEW basis (built from m_star), since H is in that basis
+            u_eli2, v_eli2 = _tangent_basis(m_star[eligible])           # (Ke, 3)
+            # Re-gather per-primitive (xi, h) using new basis
+            mu_rep_eli = mu_rep                                         # (N*M, 3)
+            idx_flat_eli = idx_flat                                     # (N*M,)
+            elig_mask = eligible[idx_flat_eli]                          # (N*M,)
+            if elig_mask.any():
+                # Build full-K u/v tensors using the new basis for eligible groups
+                u_at = torch.zeros_like(self._u_cache)                  # (K, 3)
+                v_at = torch.zeros_like(self._v_cache)
+                u_at[eligible] = u_eli2
+                v_at[eligible] = v_eli2
+                m_at = m_star                                            # (K, 3)
+                # Relative position from new q_star, in new tangent frame
+                diff_to_new_q = mu_rep - q_star[idx_flat_eli]            # (N*M, 3)
+                u_per = u_at[idx_flat_eli]
+                v_per = v_at[idx_flat_eli]
+                m_per = m_at[idx_flat_eli]
+                xi_u = (diff_to_new_q * u_per).sum(dim=-1)               # (N*M,)
+                xi_v = (diff_to_new_q * v_per).sum(dim=-1)
+                h_off = (diff_to_new_q * m_per).sum(dim=-1)              # (N*M,)
+                # Build design row: a = (0.5 xi_u^2, xi_u*xi_v, 0.5 xi_v^2, 1)
+                ones = torch.ones_like(xi_u)
+                a = torch.stack([0.5 * xi_u.pow(2),
+                                 xi_u * xi_v,
+                                 0.5 * xi_v.pow(2),
+                                 ones], dim=-1)                          # (N*M, 4)
+                # Weighted outer product accumulator per group  (K, 4, 4)
+                aa = a.unsqueeze(-1) * a.unsqueeze(-2)
+                aa_w = w_flat.view(-1, 1, 1) * aa
+                ATA = torch.zeros(K, 4, 4, device=device).index_add_(0, idx_flat_eli, aa_w)
+                # Weighted RHS: a * h    (K, 4)
+                ah_w = (w_flat * h_off).unsqueeze(-1) * a
+                ATb = torch.zeros(K, 4, device=device).index_add_(0, idx_flat_eli, ah_w)
+                # Solve only for eligible groups; ridge-regularize to avoid singularity
+                lam_reg = 1e-4
+                ATA_eli = ATA[eligible] + lam_reg * torch.eye(4, device=device).unsqueeze(0)
+                ATb_eli = ATb[eligible]
+                try:
+                    sol = torch.linalg.solve(ATA_eli, ATb_eli)            # (Ke, 4)
+                    # Take only the first 3 entries: (Huu, Huv, Hvv).  The
+                    # 4th entry (constant offset c) is discarded.
+                    H_star[eligible] = sol[:, :3]
+                except Exception:
+                    # Singular system -- leave H unchanged for these groups
+                    pass
+
+        # Damped overwrite of curvature (separately from geometry; safer to
+        # use larger damping on H since it can grow large quickly)
+        with torch.no_grad():
+            eta_curv = 0.2  # smaller damping for stability
+            new_H = (1.0 - eta_curv) * self._H + eta_curv * H_star
+            # Clamp curvature magnitude to avoid runaway
+            H_max = 50.0
+            new_H = new_H.clamp(min=-H_max, max=H_max)
+            self._H.copy_(new_H)
+
         # SH update (optional)
         if primitive_sh is not None:
             assert primitive_sh.shape == (N, self.sh_channels), (
@@ -671,6 +768,10 @@ class GroupModel:
         self._sh_grp = nn.Parameter(
             torch.cat([self._sh_grp.detach(), sh_new.unsqueeze(0)], dim=0)
         )
+        # New group starts flat (H = 0)
+        self._H = nn.Parameter(
+            torch.cat([self._H.detach(), torch.zeros(1, 3, device=device)], dim=0)
+        )
         self.grad_accum = torch.cat([self.grad_accum, torch.zeros(1, device=device)])
         self.mass_accum = torch.cat([self.mass_accum, torch.zeros(1, device=device)])
         self.birth_iter = torch.cat(
@@ -708,6 +809,7 @@ class GroupModel:
         self._m = nn.Parameter(self._m.detach()[keep])
         self._log_rho = nn.Parameter(self._log_rho.detach()[keep])
         self._sh_grp = nn.Parameter(self._sh_grp.detach()[keep])
+        self._H = nn.Parameter(self._H.detach()[keep])
         self.grad_accum = self.grad_accum[keep]
         self.mass_accum = self.mass_accum[keep]
         self.birth_iter = self.birth_iter[keep]

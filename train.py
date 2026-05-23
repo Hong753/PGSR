@@ -109,7 +109,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         print(f"[GMS] enabling groups: K_init = {K_init} for {n_sfm} primitives, "
               f"normal_mode={args.gms_normal_mode}, "
               f"position_mode={args.gms_position_mode}, "
-              f"appearance_mode={args.gms_appearance_mode}")
+              f"appearance_mode={args.gms_appearance_mode}, "
+              f"sigma_theta={args.gms_sigma_theta} (active after iter "
+              f"{args.gms_sigma_theta_start_iter})")
         gaussians.enable_groups(
             K_init=K_init,
             top_m=args.gms_top_m,
@@ -117,6 +119,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             normal_mode=args.gms_normal_mode,
             position_mode=args.gms_position_mode,
             appearance_mode=args.gms_appearance_mode,
+            sigma_theta=0.0,   # start disabled; flipped on at start_iter
         )
 
     app_model = AppModel()
@@ -383,6 +386,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 lambda_rho=args.gms_lambda_rho,
                 lambda_align=args.gms_lambda_align,
                 lambda_plane=args.gms_lambda_plane,
+                lambda_surf=args.gms_lambda_surf,
+                lambda_curv=args.gms_lambda_curv,
             )
             loss = loss + gms_aux
 
@@ -476,6 +481,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     and iteration > args.gms_T_warm
                     and iteration % args.gms_T_E == 0):
                 gaussians.e_step_update()
+
+            # ---- GMS: activate surface-aware (normal-direction) assignment
+            # once primitive rotations are informative.  Flip the flag once,
+            # at the configured start_iter.
+            if (getattr(args, "use_gms", False)
+                    and gaussians.use_groups
+                    and args.gms_sigma_theta > 0
+                    and gaussians.sigma_theta == 0.0
+                    and iteration >= args.gms_sigma_theta_start_iter):
+                gaussians.sigma_theta = args.gms_sigma_theta
+                gaussians._invalidate_cache()
+                print(f"[GMS iter {iteration}] activating surface-aware "
+                      f"assignment: sigma_theta = {args.gms_sigma_theta}")
 
             # Optimizer step
             if iteration < opt.iterations:
@@ -610,12 +628,34 @@ if __name__ == "__main__":
                              "Ablation flag.")
     parser.add_argument("--gms_lambda_align", type=float, default=1e-2,
                         help="Weight for the normal-alignment loss (only active when "
-                             "--gms_normal_mode rotation).  0 disables.")
+                             "--gms_normal_mode rotation).  0 disables. "
+                             "When curvature is non-zero, alignment target is the "
+                             "position-dependent surface normal.")
     parser.add_argument("--gms_lambda_plane", type=float, default=0.0,
-                        help="Weight for the position-plane soft prior: pulls each "
-                             "primitive toward its group's plane in 3D position. "
-                             "Direct geometric influence of groups on positions. "
+                        help="Weight for the position-plane (FLAT) soft prior. "
+                             "Deprecated when curvature is enabled; use lambda_surf.")
+    parser.add_argument("--gms_lambda_surf", type=float, default=0.0,
+                        help="Weight for the curved-surface position prior: "
+                             "sum pi_ik (h_off_ik - z_k(xi_ik))^2 / N. "
+                             "Pulls each primitive onto its group's quadric surface. "
+                             "Direct geometric influence of groups on primitive depth. "
                              "0 disables (default).")
+    parser.add_argument("--gms_lambda_curv", type=float, default=1e-4,
+                        help="Weight for the curvature magnitude regularizer "
+                             "||H_k||^2 / K.  Prevents runaway curvature.")
+    parser.add_argument("--gms_sigma_theta", type=float, default=0.0,
+                        help="Angular bandwidth for normal-direction term in soft "
+                             "assignment.  0 (default) = purely spatial assignment. "
+                             "Typical non-zero value 0.3 makes assignment SURFACE-AWARE: "
+                             "primitives prefer groups whose plane normal matches their "
+                             "own.  Helps prevent k-means' arbitrary spatial chunking "
+                             "of flat surfaces.")
+    parser.add_argument("--gms_sigma_theta_start_iter", type=int, default=3000,
+                        help="Iteration at which to start applying the normal-direction "
+                             "term in soft assignment.  Before this iter, primitive "
+                             "rotations are uninformative (SfM init) and using them in "
+                             "the kernel would bias toward random initial directions. "
+                             "Default 3000 matches the E-step warmup.")
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)

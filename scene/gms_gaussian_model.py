@@ -44,28 +44,43 @@ def soft_assign_anisotropic(
     top_m: int = 4,
     sigma_n: float = 0.05,
     chunk_size: int = 65536,
+    n_prim: torch.Tensor | None = None,
+    sigma_theta: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Top-M soft assignment using an anisotropic Gaussian kernel on
-    (perpendicular distance to plane, in-plane distance to center).
+    (perpendicular distance to plane, in-plane distance to center,
+    optional normal-direction alignment).
 
     pi_ik proportional to exp(- (m_k . d_ik)^2 / (2 sigma_n^2)
-                              - (u_k . d_ik)^2 / (2 rho_u_k^2)
-                              - (v_k . d_ik)^2 / (2 rho_v_k^2))
-    where d_ik = mu_i - q_k, and (u_k, v_k) are the Gram-Schmidt tangent
-    basis built from m_k (cached in the group model).  rho_u, rho_v are
-    per-group, per-axis in-plane scales.
+                              - (u_k . d_ik)^2 / (4 rho_u_k^2)
+                              - (v_k . d_ik)^2 / (4 rho_v_k^2)
+                              - (1 - (n_i . m_k)^2) / (2 sigma_theta^2))
+    where d_ik = mu_i - q_k, and (u_k, v_k) are the cached Gram-Schmidt
+    tangent basis from m_k.
 
-    Memory-bounded by chunking over primitives.  Peak intermediate tensor
-    is (chunk_size, K, 3), not (N, K, 3).
+    The normal-direction term (when sigma_theta > 0 and n_prim is given)
+    pulls each primitive toward groups whose plane normal matches its own
+    rotation-derived normal direction.  This makes the assignment
+    SURFACE-AWARE rather than purely spatial.  On flat regions where many
+    primitives share the same normal, this allows a single group to claim
+    all of them regardless of k-means' arbitrary spatial chunking.
 
     Parameters
     ----------
     mu : (N, 3) tensor
+        Primitive world positions.
     group_model : GroupModel
     top_m : int
     sigma_n : float
+        Perpendicular-distance bandwidth.
     chunk_size : int
-        Primitives per chunk.
+        Primitives per chunk (memory bound).
+    n_prim : (N, 3) tensor or None
+        Per-primitive normal directions (unit vectors).  If None, the
+        normal-direction term is skipped.
+    sigma_theta : float
+        Angular bandwidth for the normal-direction term.  Typical value
+        ~0.3 (signless cos^2 ≈ 0.91 at the half-weight point).  0 disables.
 
     Returns
     -------
@@ -78,6 +93,10 @@ def soft_assign_anisotropic(
     M = min(top_m, K)
     device = mu.device
     dtype = mu.dtype
+    use_normal_term = (n_prim is not None) and (sigma_theta > 0)
+    if use_normal_term:
+        assert n_prim.shape == mu.shape, \
+            f"n_prim shape {tuple(n_prim.shape)} != mu shape {tuple(mu.shape)}"
 
     q = group_model.q                                  # (K, 3)
     m_k = group_model.m                                # (K, 3) unit
@@ -99,6 +118,8 @@ def soft_assign_anisotropic(
     # isotropic-to-anisotropic refactor.
     inv_4rho_u2 = 1.0 / (4.0 * rho_uv[:, 0].pow(2) + 1e-12)  # (K,)
     inv_4rho_v2 = 1.0 / (4.0 * rho_uv[:, 1].pow(2) + 1e-12)  # (K,)
+    inv_2st2 = (1.0 / (2.0 * sigma_theta ** 2 + 1e-12)
+                if use_normal_term else 0.0)
 
     pi_out = torch.empty(N, M, device=device, dtype=dtype)
     idx_out = torch.empty(N, M, device=device, dtype=torch.long)
@@ -118,6 +139,14 @@ def soft_assign_anisotropic(
                    + d_u.pow(2) * inv_4rho_u2.unsqueeze(0)
                    + d_v.pow(2) * inv_4rho_v2.unsqueeze(0))
         del perp, d_u, d_v
+        # Normal-direction term: penalizes mismatch between primitive's own
+        # normal n_i and the group's plane normal m_k.  Signless: a flipped
+        # normal still counts as aligned (PGSR's normals are sign-ambiguous).
+        if use_normal_term:
+            n_chunk = n_prim[start:end]                           # (C, 3)
+            # cos = n_i . m_k -- (C, K)
+            cos_nm = n_chunk @ m_k.T                              # (C, K)
+            logits = logits - (1.0 - cos_nm.pow(2)) * inv_2st2
 
         top_vals, top_idx = torch.topk(logits, k=M, dim=1)        # (C, M)
         del logits
@@ -152,6 +181,7 @@ class GMSGaussianModel(GaussianModel):
         self.group_model: GroupModel | None = None
         self.top_m: int = 4
         self.sigma_n: float = 0.05            # perpendicular bandwidth
+        self.sigma_theta: float = 0.0         # normal-direction bandwidth (0 = off)
         self.normal_mode: str = 'rotation'    # 'group' or 'rotation'
         self.position_mode: str = 'group'     # 'group' or 'free'
         self.appearance_mode: str = 'group'   # 'group' or 'free'
@@ -187,6 +217,7 @@ class GMSGaussianModel(GaussianModel):
         normal_mode: str = 'rotation',
         position_mode: str = 'group',
         appearance_mode: str = 'group',
+        sigma_theta: float = 0.0,
     ) -> None:
         """Initialize the GroupModel from the current SfM-derived primitives
         and switch on group-anchored geometry.
@@ -221,6 +252,13 @@ class GMSGaussianModel(GaussianModel):
             'group':    c_i = sum_k pi_ik c^grp_k + c^res_i (Eq. 8).
             'free':     c_i = c^res_i only (i.e., group SH disabled).  This
                         ablation isolates the effect of hierarchical SH.
+        sigma_theta : float
+            Angular bandwidth for the normal-direction term in soft
+            assignment.  0 (default) disables it -- assignment is purely
+            spatial.  Typical non-zero value 0.3 (signless cos ≈ 0.95
+            at half-weight point).  Makes assignment SURFACE-AWARE rather
+            than purely spatial: primitives prefer groups whose plane
+            normal matches their own rotation-derived normal.
         """
         assert self._xyz.numel() > 0, "Call create_from_pcd before enable_groups."
         assert normal_mode in ('group', 'rotation'), normal_mode
@@ -230,6 +268,7 @@ class GMSGaussianModel(GaussianModel):
         self.use_groups = True
         self.top_m = top_m
         self.sigma_n = sigma_n
+        self.sigma_theta = sigma_theta
         self.normal_mode = normal_mode
         self.position_mode = position_mode
         self.appearance_mode = appearance_mode
@@ -282,6 +321,11 @@ class GMSGaussianModel(GaussianModel):
         self.optimizer.add_param_group(
             {'params': [gm._sh_grp], 'lr': 0.10 * feature_lr, 'name': 'grp_sh'}
         )
+        # Curvature: small LR.  Most curvature updates come from the
+        # closed-form E-step least-squares; gradient is a fine-tuning signal.
+        self.optimizer.add_param_group(
+            {'params': [gm._H], 'lr': 0.01 * position_lr, 'name': 'grp_H'}
+        )
 
         # In 'group' position mode, the primitive's _xyz is derived from
         # group state, so we freeze it.  In 'free' mode, _xyz remains the
@@ -324,8 +368,17 @@ class GMSGaussianModel(GaussianModel):
         else:
             mu = self._xyz.detach()
 
+        # Surface-aware assignment: pass per-primitive normals so the kernel
+        # can prefer groups whose plane normal matches the primitive's.
+        # Skip the normal term during initial setup (initial=True): primitive
+        # normals from SfM initialization are uninformative.
+        n_prim = None
+        if (not initial) and self.sigma_theta > 0:
+            n_prim = self.get_smallest_axis().detach()        # (N, 3) unit
         pi, idx = soft_assign_anisotropic(
-            mu, self.group_model, top_m=self.top_m, sigma_n=self.sigma_n
+            mu, self.group_model, top_m=self.top_m,
+            sigma_n=self.sigma_n,
+            n_prim=n_prim, sigma_theta=self.sigma_theta,
         )
         xi, h = self.group_model.project(mu, idx)       # (N, M, 2), (N, M)
 
@@ -405,8 +458,13 @@ class GMSGaussianModel(GaussianModel):
                 # First call or post-densification: bootstrap with uniform-pi
                 # reconstruction.  This is the expensive path, taken once.
                 mu = self._reconstruct_mu_with_uniform_pi()
+            # Surface-aware assignment: pass primitive normals when enabled
+            n_prim = (self.get_smallest_axis().detach()
+                      if self.sigma_theta > 0 else None)
             pi, _ = soft_assign_anisotropic(
-                mu, self.group_model, top_m=self.top_m, sigma_n=self.sigma_n
+                mu, self.group_model, top_m=self.top_m,
+                sigma_n=self.sigma_n,
+                n_prim=n_prim, sigma_theta=self.sigma_theta,
             )
         self._cached_pi = pi
         return pi
@@ -666,9 +724,29 @@ class GMSGaussianModel(GaussianModel):
         # Synthesize new xi, h from the new positions
         new_xyz = tensors_dict['xyz']                     # (M_new, 3)
         with torch.no_grad():
+            # New primitives' rotations were just set by densify_and_clone/split
+            # (copied from parent primitives).  Their normals are informative
+            # so we use the surface-aware kernel here too.
+            n_prim_new = None
+            if self.sigma_theta > 0 and 'rotation' in tensors_dict:
+                # Derive the new primitives' normals from their fresh rotations.
+                # Use the same smallest-axis-of-rotation convention as the
+                # rest of the model.
+                from utils.general_utils import build_rotation
+                R_new = build_rotation(tensors_dict['rotation'])  # (M_new, 3, 3)
+                # Smallest-scale axis index from new_scaling
+                new_scaling_act = self.scaling_activation(tensors_dict['scaling'])
+                sa_idx = new_scaling_act.argmin(dim=-1)             # (M_new,)
+                sa_idx = sa_idx[..., None, None].expand(-1, 3, -1)
+                n_prim_new = R_new.gather(2, sa_idx).squeeze(-1)
+                # Normalize
+                n_prim_new = n_prim_new / n_prim_new.norm(
+                    dim=-1, keepdim=True
+                ).clamp_min(1e-8)
             new_pi, new_idx = soft_assign_anisotropic(
                 new_xyz, self.group_model,
                 top_m=self.top_m, sigma_n=self.sigma_n,
+                n_prim=n_prim_new, sigma_theta=self.sigma_theta,
             )
             new_xi, new_h = self.group_model.project(new_xyz, new_idx)
 
@@ -937,6 +1015,7 @@ class GMSGaussianModel(GaussianModel):
             'grp_m': gm._m,
             'grp_log_rho': gm._log_rho,
             'grp_sh': gm._sh_grp,
+            'grp_H': gm._H,
         }
         for group in self.optimizer.param_groups:
             if group['name'] not in param_to_attr:
@@ -979,6 +1058,7 @@ class GMSGaussianModel(GaussianModel):
             'grp_m': gm._m,
             'grp_log_rho': gm._log_rho,
             'grp_sh': gm._sh_grp,
+            'grp_H': gm._H,
         }
         old_state = {}
         for group in self.optimizer.param_groups:
@@ -1003,6 +1083,7 @@ class GMSGaussianModel(GaussianModel):
             'grp_m': gm._m,
             'grp_log_rho': gm._log_rho,
             'grp_sh': gm._sh_grp,
+            'grp_H': gm._H,
         }
         for group in self.optimizer.param_groups:
             if group['name'] not in new_params:
@@ -1033,6 +1114,8 @@ class GMSGaussianModel(GaussianModel):
         lambda_rho: float = 1e-4,
         lambda_align: float = 0.0,
         lambda_plane: float = 0.0,
+        lambda_surf: float = 0.0,
+        lambda_curv: float = 0.0,
     ) -> torch.Tensor:
         """Compute the auxiliary GMS loss terms.
 
@@ -1042,15 +1125,18 @@ class GMSGaussianModel(GaussianModel):
           lambda_r     : weight on per-primitive residual SH magnitude
           lambda_d     : weight on the joint mass+evidence death prior
           lambda_rho   : weight on the rho floor
-          lambda_align : weight on the normal-alignment loss (only meaningful
-                         when normal_mode='rotation')
-          lambda_plane : weight on the position-plane soft prior:
-                         sum_i sum_k pi_ik * (m_k . (mu_i - q_k))^2 / N
-                         Pulls each primitive toward its group's plane in
-                         position.  Active in any position mode; in 'free'
-                         mode it gives groups a direct geometric influence
-                         on primitive positions that the alignment loss
-                         alone does not provide.
+          lambda_align : weight on the normal-alignment loss.  When curvature
+                         is non-zero, the target is the position-DEPENDENT
+                         surface normal of the assigned groups.
+          lambda_plane : weight on flat-plane position prior (deprecated; use
+                         lambda_surf for curved-surface position prior).
+          lambda_surf  : weight on curved-surface position prior:
+                         sum pi_ik (m_k . (mu_i - q_k) - z_k(xi_ik))^2.
+                         Pulls each primitive onto the group's QUADRIC
+                         surface (not just plane).  Direct geometric
+                         influence of groups on primitive depth.
+          lambda_curv  : weight on curvature regularizer ||H_k||^2 / K.
+                         Prevents runaway curvature.
 
         Returns a scalar loss to add to L_PGSR.
         """
@@ -1058,7 +1144,7 @@ class GMSGaussianModel(GaussianModel):
             return torch.zeros((), device=self._xyz.device)
 
         pi = self._get_assignment()
-        # Off-plane displacement prior
+        # Off-plane displacement prior (only meaningful in pos=group mode)
         loss_h = (pi * self._h.pow(2)).sum() / max(1, self._xi.shape[0])
 
         # Residual SH prior
@@ -1081,37 +1167,71 @@ class GMSGaussianModel(GaussianModel):
                  + lambda_d * loss_d
                  + lambda_rho * loss_rho)
 
-        # Optional alignment loss (used when normal_mode='rotation')
-        if lambda_align > 0:
-            # Smallest-scale axis of the per-primitive rotation
-            rotmat = self.get_rotation_matrix()                  # (N, 3, 3)
-            smallest_axis_idx = self.get_scaling.min(dim=-1)[1]  # (N,)
-            # Gather the column of rotmat corresponding to the smallest scale
-            sa_idx = smallest_axis_idx[..., None, None].expand(-1, 3, -1)
-            smallest_axis = rotmat.gather(2, sa_idx).squeeze(-1)  # (N, 3)
-            # Group-mixed normal (no camera flip; alignment is signless)
+        # Pre-compute curvature-aware quantities if any term needs them
+        needs_curvature_terms = (lambda_align > 0) or (lambda_surf > 0)
+        if needs_curvature_terms:
             attrs = self.group_model.gather_at(self._topk_idx)
-            n_grp = (pi.unsqueeze(-1) * attrs['m']).sum(dim=1)
-            n_grp = _safe_unit(n_grp)
-            # Signless alignment: 1 - (a . n)^2
-            cos_sq = (smallest_axis * n_grp).sum(dim=-1).pow(2)
+            # attrs['q','m','u','v','H']: (N, M, 3) or (N, M, 3) packed
+            mu = self.get_xyz                                 # (N, 3)
+            mu_exp = mu.unsqueeze(1)                          # (N, 1, 3)
+            diff = mu_exp - attrs['q']                        # (N, M, 3)
+            # Chart coords in each top-M group's tangent frame (LIVE,
+            # not stale _xi/_h)
+            xi_u = (diff * attrs['u']).sum(dim=-1)            # (N, M)
+            xi_v = (diff * attrs['v']).sum(dim=-1)            # (N, M)
+            h_off = (diff * attrs['m']).sum(dim=-1)           # (N, M)
+            # Quadric height: z_k(xi) = 0.5 * (Huu xi_u^2 + 2 Huv xi_u xi_v + Hvv xi_v^2)
+            H_pack = attrs['H']                               # (N, M, 3): (Huu, Huv, Hvv)
+            z_k = 0.5 * (H_pack[..., 0] * xi_u.pow(2)
+                         + 2.0 * H_pack[..., 1] * xi_u * xi_v
+                         + H_pack[..., 2] * xi_v.pow(2))      # (N, M)
+
+        # Curvature-aware normal-alignment loss
+        if lambda_align > 0:
+            # Compute target normal at each (i, k) using the local surface tangents
+            # at (xi_u, xi_v).  The surface gradient is (Huu xi_u + Huv xi_v,
+            # Huv xi_u + Hvv xi_v) in the (u, v) basis.  The implicit normal
+            # is m_k - grad_u * u_k - grad_v * v_k, then normalized.
+            grad_u = H_pack[..., 0] * xi_u + H_pack[..., 1] * xi_v   # (N, M)
+            grad_v = H_pack[..., 1] * xi_u + H_pack[..., 2] * xi_v   # (N, M)
+            n_target = (attrs['m']
+                        - grad_u.unsqueeze(-1) * attrs['u']
+                        - grad_v.unsqueeze(-1) * attrs['v'])         # (N, M, 3)
+            # Pi-weighted sum, then normalize: aggregate target across top-M groups
+            n_grp_curved = (pi.unsqueeze(-1) * n_target).sum(dim=1)  # (N, 3)
+            n_grp_curved = _safe_unit(n_grp_curved)
+
+            # Primitive's smallest-axis (same as PGSR's normal convention)
+            rotmat = self.get_rotation_matrix()                       # (N, 3, 3)
+            smallest_axis_idx = self.get_scaling.min(dim=-1)[1]       # (N,)
+            sa_idx = smallest_axis_idx[..., None, None].expand(-1, 3, -1)
+            smallest_axis = rotmat.gather(2, sa_idx).squeeze(-1)      # (N, 3)
+            # Signless alignment
+            cos_sq = (smallest_axis * n_grp_curved).sum(dim=-1).pow(2)
             loss_align = (1.0 - cos_sq).mean()
             total = total + lambda_align * loss_align
 
-        # Optional plane-position prior:
-        # Pull each primitive toward its assigned group's plane.
-        # L_plane = (1/N) * sum_i sum_k pi_ik * (m_k . (mu_i - q_k))^2
-        # This gives groups a direct geometric influence on primitive
-        # positions (not just normals).  Differentiable in mu via the
-        # gradient path back to the underlying position parameters.
+        # Curved-surface position prior: primitives should lie on the group's
+        # quadric surface, not just near its tangent plane.
+        # L_surf = (1/N) sum_i sum_k pi_ik * (h_off_ik - z_k(xi_ik))^2
+        if lambda_surf > 0:
+            surf_dist = h_off - z_k                            # (N, M)
+            loss_surf = (pi * surf_dist.pow(2)).sum() / max(1, mu.shape[0])
+            total = total + lambda_surf * loss_surf
+
+        # Optional flat-plane prior (kept for backward compatibility / ablation)
         if lambda_plane > 0:
-            attrs = self.group_model.gather_at(self._topk_idx)   # q (N,M,3), m (N,M,3)
-            mu = self.get_xyz                                    # (N, 3)
-            # Perpendicular displacement of each primitive from each top-M group
-            diff = mu.unsqueeze(1) - attrs['q']                  # (N, M, 3)
-            perp = (diff * attrs['m']).sum(dim=-1)               # (N, M)
+            attrs2 = self.group_model.gather_at(self._topk_idx)
+            mu = self.get_xyz
+            diff2 = mu.unsqueeze(1) - attrs2['q']
+            perp = (diff2 * attrs2['m']).sum(dim=-1)
             loss_plane = (pi * perp.pow(2)).sum() / max(1, mu.shape[0])
             total = total + lambda_plane * loss_plane
+
+        # Curvature magnitude regularizer
+        if lambda_curv > 0:
+            loss_curv = gm._H.pow(2).sum() / max(1, gm.K)
+            total = total + lambda_curv * loss_curv
 
         return total
 
