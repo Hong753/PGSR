@@ -5,7 +5,7 @@ scenes = [65]
 data_base_path='/workspace/colmap_scenes/DTU/dtu'
 out_base_path='/workspace/colmap_scenes/DTU/dtu_output'
 eval_path='/workspace/colmap_scenes/DTU/dtu_eval'
-out_name='gms'
+out_name='vpss'
 gpu_id=0
 
 for scene in scenes:
@@ -14,17 +14,13 @@ for scene in scenes:
     os.system(cmd)
 
     common_args = "--quiet -r2 --ncc_scale 0.5"
-    # common_args = "-r2 --ncc_scale 0.5 --use_gms"
     
-    # C2 isotropic — our best measured
-    common_args = "-r2 --ncc_scale 0.5 --use_gms --gms_position_mode free --gms_appearance_mode group --gms_normal_mode rotation --gms_lambda_align 5e-2 --gms_lambda_plane 0 --gms_top_m 4"
-        
     cmd = f'CUDA_VISIBLE_DEVICES={gpu_id} python train.py -s {data_base_path}/scan{scene} -m {out_base_path}/dtu_scan{scene}/{out_name} {common_args}'
     print(cmd)
     os.system(cmd)
 
     common_args = "--quiet --num_cluster 1 --voxel_size 0.002 --max_depth 5.0"
-    cmd = f'CUDA_VISIBLE_DEVICES={gpu_id} python render.py -m {out_base_path}/dtu_scan{scene}/{out_name} {common_args}'
+    cmd = f'CUDA_VISIBLE_DEVICES={gpu_id} python render_chart.py -m {out_base_path}/dtu_scan{scene}/{out_name}'
     print(cmd)
     os.system(cmd)
 
