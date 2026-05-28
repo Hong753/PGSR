@@ -20,6 +20,7 @@ from utils.graphics_utils import patch_offsets, patch_warp
 from gaussian_renderer import render, network_gui
 import sys, time
 from scene import Scene, GaussianModel
+from scene.vpss_gaussian_model import VPSSGaussianModel
 from utils.general_utils import safe_state
 import cv2
 import uuid
@@ -78,7 +79,7 @@ def gen_virtul_cam(cam, trans_noise=1.0, deg_noise=15.0):
                         preload_img=False, data_device = "cuda")
     return virtul_cam
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, args=None):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     # backup main code
@@ -93,8 +94,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     cmd = f'cp -rf ./utils {dataset.model_path}/'
     os.system(cmd)
 
-    gaussians = GaussianModel(dataset.sh_degree)
+    if getattr(args, "use_vpss", False):
+        gaussians = VPSSGaussianModel(dataset.sh_degree)
+    else:
+        gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
+    if getattr(args, "use_vpss", False):
+        sigma_0 = getattr(args, "vpss_sigma_0", 0.002)
+        print(f"[VPSS] enabling variational posterior with sigma_0={sigma_0} "
+              f"on {gaussians.get_xyz.shape[0]} primitives")
+        gaussians.enable_vpss(sigma_0=sigma_0)
     gaussians.training_setup(opt)
 
     app_model = AppModel()
@@ -141,6 +150,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         iter_start.record()
         gaussians.update_learning_rate(iteration)
+        # VPSS: fresh z per iteration; get_xyz inside render() picks it up
+        if getattr(args, "use_vpss", False):
+            gaussians.training_mode = True
+            gaussians.sample_z()
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
@@ -173,6 +186,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             Ll1 = l1_loss(image, gt_image)
         image_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss
         loss = image_loss.clone()
+
+        # VPSS ELBO KL regulariser with linear annealing on beta
+        if getattr(args, "use_vpss", False):
+            beta_target  = getattr(args, "vpss_beta", 1e-4)
+            anneal_iters = getattr(args, "vpss_anneal_iters", 5000)
+            warmup_iters = getattr(args, "vpss_warmup_iters", 3000)
+            if iteration < warmup_iters:
+                beta = 0.0
+            else:
+                t = min(1.0, (iteration - warmup_iters) / max(1, anneal_iters))
+                beta = beta_target * t
+            gaussians.beta_kl = beta
+            if beta > 0:
+                kl_loss = gaussians.compute_kl_loss() / max(1, gaussians.get_xyz.shape[0])
+                loss = loss + beta * kl_loss
         
         # scale loss
         if visibility_filter.sum() > 0:
@@ -483,6 +511,16 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--use_vpss", action='store_true',
+                        help="Enable Variational Per-primitive Surface Splatting")
+    parser.add_argument("--vpss_sigma_0", type=float, default=0.002,
+                        help="VPSS prior std on offset along normal (scene units)")
+    parser.add_argument("--vpss_beta", type=float, default=1e-4,
+                        help="VPSS KL weight after annealing")
+    parser.add_argument("--vpss_anneal_iters", type=int, default=5000,
+                        help="Iterations to linearly anneal KL beta from 0")
+    parser.add_argument("--vpss_warmup_iters", type=int, default=3000,
+                        help="Iterations before KL begins (let mu settle first)")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -494,7 +532,7 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     # network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args=args)
 
     # All done
     print("\nTraining complete.")
