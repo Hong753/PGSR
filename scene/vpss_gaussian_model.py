@@ -217,7 +217,10 @@ class VPSSGaussianModel(GaussianModel):
         sigma = self.get_sigma                          # (N, 1)
 
         if training:
-            if self._z_cached is None:
+            # Resample z if absent OR if shape went stale (densification / prune
+            # change N between the previous sample_z() and this call).
+            if (self._z_cached is None
+                    or self._z_cached.shape[0] != self._mu.shape[0]):
                 self.sample_z()
             eps = mu + sigma * self._z_cached           # reparam trick
         else:
@@ -324,7 +327,7 @@ class VPSSGaussianModel(GaussianModel):
         self._log_sigma     = optimizable_tensors["log_sigma"]
 
         # Reset gradient accumulators
-        N = self.get_xyz.shape[0]
+        N = self._xyz.shape[0]
         self.xyz_gradient_accum     = torch.zeros((N, 1), device="cuda")
         self.xyz_gradient_accum_abs = torch.zeros((N, 1), device="cuda")
         self.denom                  = torch.zeros((N, 1), device="cuda")
